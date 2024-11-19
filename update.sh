@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Script location
-SCRIPT_DIR="/home/$USER/YOUR_REPO_NAME"
+SCRIPT_DIR="/home/nrmaskell/terraforming-mars-monitor"
 LOG_FILE="$SCRIPT_DIR/autoupdate.log"
 
 # Function to log messages
