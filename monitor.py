@@ -17,39 +17,40 @@ logging.basicConfig(
 class TerraformingMarsMonitor:
     def __init__(self):
         self.base_url = "https://terraforming-mars.herokuapp.com"
-        self.player_id = os.environ.get('PLAYER_ID')
-        self.game_age = 22
-        self.undo_count = 0
-        self.current_waiting_for = None
+        self.game_id = os.environ.get('GAME_ID', 'gca44cdf55303')
+        self.current_state = None
         
-        # WhatsApp credentials from environment variables
+        # WhatsApp credentials
         self.whatsapp_token = os.environ.get('WHATSAPP_TOKEN')
         self.whatsapp_phone_id = os.environ.get('WHATSAPP_PHONE_ID')
-        self.recipient_phones = os.environ.get('RECIPIENT_PHONES', '').split(',')
         
-        # Player name mapping
-        self.players = {
-            "red": "Tess",
-            "blue": "Nick",
-            "green": "Katrin",
-            "yellow": "Joe"
+        # Player phone number mapping from environment variables
+        self.player_phones = {
+            "Katrin": os.environ.get('KATRIN_PHONE'),
+            "Joe": os.environ.get('JOE_PHONE'),
+            "Nick": os.environ.get('NICK_PHONE'),
+            "Tess": os.environ.get('TESS_PHONE')
         }
         
         # Verify configuration
-        if not all([self.player_id, self.whatsapp_token, self.whatsapp_phone_id, self.recipient_phones]):
-            logging.error("Missing required environment variables!")
-            raise ValueError("Missing required environment variables!")
-        
-        logging.info("Monitor initialized successfully")
-        logging.info(f"Player ID: {self.player_id}")
-        logging.info(f"Number of recipients: {len(self.recipient_phones)}")
-    
-    def get_player_name(self, color):
-        """Convert color to player name"""
-        return self.players.get(color.lower(), color)
+        if not all([self.whatsapp_token, self.whatsapp_phone_id]):
+            logging.error("Missing required WhatsApp environment variables!")
+            raise ValueError("Missing required WhatsApp environment variables!")
+            
+        # Log which phone numbers are configured
+        logging.info("Configured phone numbers:")
+        for player, phone in self.player_phones.items():
+            if phone:
+                logging.info(f"{player}: Configured")
+            else:
+                logging.warning(f"{player}: Missing phone number")
 
-    def send_whatsapp_message(self, message):
-        """Send a WhatsApp message to all recipients"""
+    def send_whatsapp_message(self, phone_number, message):
+        """Send a WhatsApp message to a specific number"""
+        if not phone_number:
+            logging.warning(f"No phone number provided for message: {message}")
+            return
+            
         url = f"https://graph.facebook.com/v21.0/{self.whatsapp_phone_id}/messages"
         
         headers = {
@@ -57,95 +58,113 @@ class TerraformingMarsMonitor:
             "Content-Type": "application/json"
         }
         
-        for phone in self.recipient_phones:
-            phone = phone.strip()
-            if not phone:
-                continue
-                
-            data = {
-                "messaging_product": "whatsapp",
-                "to": phone,
-                "type": "text",
-                "text": {
-                    "body": message
-                }
+        data = {
+            "messaging_product": "whatsapp",
+            "to": phone_number,
+            "type": "text",
+            "text": {
+                "body": message
             }
-            
-            try:
-                logging.info(f"Sending WhatsApp message to: {phone}")
-                response = requests.post(url, headers=headers, json=data)
-                
-                if response.status_code == 200:
-                    logging.info(f"Message sent successfully to {phone}: {message}")
-                else:
-                    logging.error(f"Failed to send to {phone}: {response.status_code}")
-                    logging.error(f"Error: {response.text}")
-            except Exception as e:
-                logging.error(f"Error sending to {phone}: {e}")
-        
-    def check_waiting_for(self):
-        """Check who the game is waiting for"""
-        url = f"{self.base_url}/api/waitingfor"
-        params = {
-            "id": self.player_id,
-            "gameAge": self.game_age,
-            "undoCount": self.undo_count
         }
         
         try:
-            response = requests.get(url, params=params, timeout=65)
+            logging.info(f"Sending WhatsApp message to: {phone_number}")
+            response = requests.post(url, headers=headers, json=data)
+            
+            if response.status_code == 200:
+                logging.info(f"Message sent successfully to {phone_number}: {message}")
+            else:
+                logging.error(f"Failed to send to {phone_number}: {response.status_code}")
+                logging.error(f"Error: {response.text}")
+        except Exception as e:
+            logging.error(f"Error sending to {phone_number}: {e}")
+
+    def get_game_state(self):
+        """Fetch the current game state"""
+        url = f"{self.base_url}/api/game"
+        params = {"id": self.game_id}
+        
+        try:
+            response = requests.get(url, params=params)
             if response.status_code == 200:
                 return response.json()
             else:
                 logging.error(f"Error fetching game state: {response.status_code}")
                 return None
-        except requests.exceptions.Timeout:
-            return None
         except Exception as e:
             logging.error(f"Error checking game state: {e}")
             return None
 
+    def get_player_name_by_color(self, color, players):
+        """Get player name from their color"""
+        for player in players:
+            if player['color'] == color:
+                return player['name']
+        return None
+
+    def notify_players(self, game_state):
+        """Send notifications based on game state changes"""
+        if not game_state:
+            return
+
+        # Check for research phase
+        if game_state.get('phase') == 'research':
+            if self.current_state is None or self.current_state.get('phase') != 'research':
+                # Send research notification to all players
+                message = "🔬 It's research time!"
+                for phone in self.player_phones.values():
+                    if phone:  # Only send if phone number is configured
+                        self.send_whatsapp_message(phone, message)
+        else:
+            # Check for player turn changes
+            active_color = game_state.get('activePlayer')
+            if active_color:
+                active_player_name = self.get_player_name_by_color(active_color, game_state.get('players', []))
+                
+                if active_player_name:
+                    # Only send message if it's a new turn
+                    if (self.current_state is None or 
+                        self.current_state.get('activePlayer') != active_color):
+                        
+                        # Get phone number for active player
+                        phone = self.player_phones.get(active_player_name)
+                        if phone:
+                            message = f"🎮 It's your turn!"
+                            self.send_whatsapp_message(phone, message)
+                        else:
+                            logging.warning(f"No phone number configured for {active_player_name}")
+        
+        # Update current state
+        self.current_state = game_state
+
     def run(self):
         """Main monitoring loop"""
         logging.info("Starting Terraforming Mars game monitor...")
+        logging.info(f"Monitoring game ID: {self.game_id}")
         
-        # Send startup message
-        self.send_whatsapp_message("🎮 Terraforming Mars monitor is now active!")
+        # Send startup message to all players
+        startup_message = "🎮 Terraforming Mars monitor is now active!"
+        for phone in self.player_phones.values():
+            if phone:  # Only send if phone number is configured
+                self.send_whatsapp_message(phone, startup_message)
         
         while True:
             try:
-                data = self.check_waiting_for()
-                
-                if data:
-                    if 'gameAge' in data:
-                        self.game_age = data['gameAge']
-                    
-                    waiting_for = data.get('waitingFor', [])
-                    
-                    if waiting_for != self.current_waiting_for:
-                        if waiting_for:
-                            if len(waiting_for) > 1:
-                                message = "🔬 Time for research!"
-                            else:
-                                name = self.get_player_name(waiting_for[0])
-                                message = f"🎮 It's {name}'s turn!"
-                            
-                            self.send_whatsapp_message(message)
-                            
-                        self.current_waiting_for = waiting_for
+                game_state = self.get_game_state()
+                self.notify_players(game_state)
+                time.sleep(5)  # Check every 5 seconds
                 
             except Exception as e:
                 logging.error(f"Error in monitor loop: {e}")
-            
-            time.sleep(5)  # Wait 5 seconds before next check
+                time.sleep(5)
+
+def main():
+    try:
+        monitor = TerraformingMarsMonitor()
+        monitor.run()
+    except Exception as e:
+        logging.error(f"Fatal error: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    while True:
-        try:
-            monitor = TerraformingMarsMonitor()
-            monitor.run()
-        except Exception as e:
-            logging.error(f"Fatal error: {e}")
-            logging.info("Restarting monitor in 60 seconds...")
-            time.sleep(60)
-            
+    main()
