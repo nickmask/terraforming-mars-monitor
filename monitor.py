@@ -5,6 +5,7 @@ import os
 import logging
 import sys
 import json
+from flask import Flask, request
 
 # Set up logging
 logging.basicConfig(
@@ -21,9 +22,10 @@ class TerraformingMarsMonitor:
         self.game_id = os.environ.get('GAME_ID', 'gca44cdf55303')
         self.current_state = None
         
-        # WhatsApp credentials
+        # WhatsApp credentials and verification
         self.whatsapp_token = os.environ.get('WHATSAPP_TOKEN')
         self.whatsapp_phone_id = os.environ.get('WHATSAPP_PHONE_ID')
+        self.webhook_verify_token = os.environ.get('WEBHOOK_VERIFY_TOKEN', 'your_verification_token')
         
         # Player phone number mapping from environment variables
         self.player_phones = {
@@ -41,6 +43,59 @@ class TerraformingMarsMonitor:
             logging.error("Missing required WhatsApp environment variables!")
             raise ValueError("Missing required WhatsApp environment variables!")
 
+    def setup_webhook_server(self):
+        """Setup Flask server for webhook with verification"""
+        app = Flask(__name__)
+
+        @app.route('/webhook', methods=['GET'])
+        def verify_webhook():
+            """Handle webhook verification from WhatsApp"""
+            mode = request.args.get('hub.mode')
+            token = request.args.get('hub.verify_token')
+            challenge = request.args.get('hub.challenge')
+
+            logging.info(f"Received verification request - Mode: {mode}, Token: {token}")
+
+            if mode and token:
+                if mode == 'subscribe' and token == self.webhook_verify_token:
+                    logging.info("Webhook verified successfully!")
+                    return challenge, 200
+                else:
+                    logging.warning("Webhook verification failed")
+                    return 'Verification failed', 403
+            return 'Invalid verification request', 400
+
+        @app.route('/webhook', methods=['POST'])
+        def webhook():
+            """Handle incoming webhook messages"""
+            try:
+                if request.is_json:
+                    data = request.get_json()
+                    logging.info(f"Received webhook data: {json.dumps(data, indent=2)}")
+                    
+                    if 'entry' in data and data['entry']:
+                        entry = data['entry'][0]
+                        if 'changes' in entry and entry['changes']:
+                            change = entry['changes'][0]
+                            if 'value' in change and 'messages' in change['value']:
+                                message = change['value']['messages'][0]
+                                from_number = message['from']
+                                message_text = message['text']['body']
+                                logging.info(f"Processing message: {message_text} from {from_number}")
+                                self.handle_incoming_message(message_text, from_number)
+                    return 'OK', 200
+                else:
+                    logging.warning("Received non-JSON webhook data")
+                    return 'Invalid format', 400
+            except Exception as e:
+                logging.error(f"Error processing webhook: {e}")
+                return 'Error processing webhook', 500
+
+        # Start the Flask app
+        port = int(os.environ.get('WEBHOOK_PORT', '3000'))
+        logging.info(f"Starting webhook server on port {port}")
+        app.run(host='0.0.0.0', port=port)
+
     def handle_incoming_message(self, message_text, from_number):
         """Handle incoming WhatsApp messages"""
         # Check if the number belongs to one of our players
@@ -49,6 +104,7 @@ class TerraformingMarsMonitor:
             return
             
         player_name = self.phone_to_player[from_number]
+        logging.info(f"Processing command from {player_name}: {message_text}")
         
         if message_text.lower().startswith('!gameid '):
             new_game_id = message_text.split(' ')[1].strip()
@@ -75,131 +131,6 @@ class TerraformingMarsMonitor:
                     from_number,
                     f"❌ Invalid game ID: {new_game_id}\n"
                     "Make sure the game exists and the ID is correct"
-                )
-                
-    def validate_game_id(self, game_id):
-        """Validate that a game ID exists"""
-        url = f"{self.base_url}/api/game"
-        params = {"id": game_id}
-        
-        try:
-            response = requests.get(url, params=params)
-            return response.status_code == 200
-        except:
-            return False
-
-    def send_whatsapp_message(self, phone_number, message):
-        """Send a WhatsApp message to a specific number"""
-        if not phone_number:
-            logging.warning(f"No phone number provided for message: {message}")
-            return
-            
-        url = f"https://graph.facebook.com/v21.0/{self.whatsapp_phone_id}/messages"
-        
-        headers = {
-            "Authorization": f"Bearer {self.whatsapp_token}",
-            "Content-Type": "application/json"
-        }
-        
-        data = {
-            "messaging_product": "whatsapp",
-            "to": phone_number,
-            "type": "text",
-            "text": {
-                "body": message
-            }
-        }
-        
-        try:
-            logging.info(f"Sending WhatsApp message to: {phone_number}")
-            response = requests.post(url, headers=headers, json=data)
-            
-            if response.status_code == 200:
-                logging.info(f"Message sent successfully to {phone_number}: {message}")
-            else:
-                logging.error(f"Failed to send to {phone_number}: {response.status_code}")
-                logging.error(f"Error: {response.text}")
-        except Exception as e:
-            logging.error(f"Error sending to {phone_number}: {e}")
-
-    def get_game_state(self):
-        """Fetch the current game state"""
-        url = f"{self.base_url}/api/game"
-        params = {"id": self.game_id}
-        
-        try:
-            response = requests.get(url, params=params)
-            if response.status_code == 200:
-                return response.json()
-            else:
-                logging.error(f"Error fetching game state: {response.status_code}")
-                return None
-        except Exception as e:
-            logging.error(f"Error checking game state: {e}")
-            return None
-
-    def get_player_name_by_color(self, color, players):
-        """Get player name from their color"""
-        for player in players:
-            if player['color'] == color:
-                return player['name']
-        return None
-
-    def notify_players(self, game_state):
-        """Send notifications based on game state changes"""
-        if not game_state:
-            return
-
-        # Check for research phase
-        if game_state.get('phase') == 'research':
-            if self.current_state is None or self.current_state.get('phase') != 'research':
-                # Send research notification to all players
-                message = "🔬 It's research time!"
-                for phone in self.player_phones.values():
-                    if phone:  # Only send if phone number is configured
-                        self.send_whatsapp_message(phone, message)
-        else:
-            # Check for player turn changes
-            active_color = game_state.get('activePlayer')
-            if active_color:
-                active_player_name = self.get_player_name_by_color(active_color, game_state.get('players', []))
-                
-                if active_player_name:
-                    # Only send message if it's a new turn
-                    if (self.current_state is None or 
-                        self.current_state.get('activePlayer') != active_color):
-                        
-                        # Get phone number for active player
-                        phone = self.player_phones.get(active_player_name)
-                        if phone:
-                            message = f"🎮 It's your turn!"
-                            self.send_whatsapp_message(phone, message)
-                        else:
-                            logging.warning(f"No phone number configured for {active_player_name}")
-        
-        # Update current state
-        self.current_state = game_state
-
-    def setup_webhook_server(self):
-        """Setup Flask server for webhook"""
-        from flask import Flask, request
-
-        app = Flask(__name__)
-
-        @app.route('/webhook', methods=['POST'])
-        def webhook():
-            if request.is_json:
-                data = request.get_json()
-                try:
-                    message = data['entry'][0]['changes'][0]['value']['messages'][0]
-                    from_number = message['from']
-                    message_text = message['text']['body']
-                    self.handle_incoming_message(message_text, from_number)
-                except Exception as e:
-                    logging.error(f"Error processing webhook: {e}")
-            return 'OK', 200
-
-        app.run(host='0.0.0.0', port=int(os.environ.get('WEBHOOK_PORT', '3000')))
 
     def run(self):
         """Main monitoring loop"""
